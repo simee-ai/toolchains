@@ -1,0 +1,179 @@
+"""Mach-O helpers: dependency listing, bundle-relative resolution, thinning, ad hoc signing."""
+
+import re
+import struct
+import subprocess
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+SYSTEM_PREFIXES = ("/System/", "/usr/lib/")
+
+
+def parse_otool(output: str) -> list[str]:
+    """Install names from `otool -L` output (the first line names the file itself)."""
+    return [line.strip().split(" (")[0] for line in output.splitlines()[1:] if line.strip()]
+
+
+def deps(binary: Path) -> list[str]:
+    out = subprocess.run(["otool", "-L", str(binary)], capture_output=True, text=True, check=True).stdout
+    return [name for name in parse_otool(out) if Path(name) != binary]
+
+
+def parse_rpaths(output: str) -> list[str]:
+    """LC_RPATH paths from `otool -l` output."""
+    lines = [line.split() for line in output.splitlines()]
+    return [lines[i + 2][1] for i, words in enumerate(lines) if words == ["cmd", "LC_RPATH"]]
+
+
+def rpaths(binary: Path) -> list[str]:
+    return parse_rpaths(subprocess.run(["otool", "-l", str(binary)], capture_output=True, text=True, check=True).stdout)
+
+
+def parse_install_id(output: str) -> str | None:
+    """A dylib's install name from `otool -D` output; None for an executable or bundle."""
+    names = output.splitlines()[1:]
+    return names[0].strip() if names and names[0].strip() else None
+
+
+def install_id(binary: Path) -> str | None:
+    return parse_install_id(subprocess.run(["otool", "-D", str(binary)], capture_output=True, text=True,
+                                           check=True).stdout)
+
+
+def make_resolver(contents: Path):
+    """Resolve install names against a KiCad.app/Contents directory; system libraries -> None."""
+    frameworks = contents / "Frameworks"
+
+    def resolve(name: str, binary: Path) -> Path | None:
+        if name.startswith(SYSTEM_PREFIXES):
+            return None
+        if name.startswith("@rpath/"):
+            rel = name[len("@rpath/"):]
+            direct = frameworks / rel
+            return direct if direct.exists() else frameworks / "Python.framework" / rel
+        if name.startswith("@executable_path/"):
+            return (contents / "MacOS" / name[len("@executable_path/"):]).resolve(strict=False)
+        if name.startswith("@loader_path/"):
+            return binary.parent / name[len("@loader_path/"):]
+        return Path(name)
+
+    return resolve
+
+
+@dataclass(frozen=True)
+class Slice:
+    uuid: str  # LC_UUID: set by the linker, kept by install_name_tool, lipo and codesign
+    minos: tuple[int, int]  # the macOS a binary was built for; Homebrew builds bottles for the OS it runs on
+    # (formula, keg version) of each Homebrew keg path the image names (Cellar/<formula>/<version>/, in
+    # directories compiled in): tells which keg a library no bottle holds was built from source as
+    kegs: frozenset[tuple[str, str]] = frozenset()
+    # A library's own current version (LC_ID_DYLIB's; None for an executable or bundle) and the base name of
+    # each library it loads (relinking moves them, keeps the names): with its file name, tells which build of
+    # a keg that names none it is (homebrew._from_source)
+    version: str | None = None
+    dylibs: frozenset[str] = frozenset()
+
+
+KEG = re.compile(rb"/Cellar/([\w@+.-]+)/(\d[\w+.-]*)/")
+ARCHS = {0x0100000C: "arm64", 0x01000007: "x86_64"}
+LC_UUID, LC_BUILD_VERSION, LC_VERSION_MIN_MACOSX, LC_ID_DYLIB = 0x1B, 0x32, 0x24, 0x0D
+# LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LAZY_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB
+LOADS = {0x0C, 0x80000018, 0x8000001F, 0x20, 0x80000023}
+
+
+def _dylib_name(data: bytes, at: int, size: int) -> str:
+    start = at + struct.unpack_from("<I", data, at + 8)[0]
+    return data[start:data.index(b"\0", start, at + size)].decode()
+
+
+def _slice(data: bytes, offset: int, length: int) -> tuple[str, Slice] | None:
+    magic, cpu, _, _, ncmds = struct.unpack_from("<IiiII", data, offset)
+    if magic != 0xFEEDFACF or cpu not in ARCHS:
+        return None
+    found, minos, own, dylibs, at = "", (0, 0), None, set(), offset + 32
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from("<II", data, at)
+        if cmd == LC_ID_DYLIB:
+            v = struct.unpack_from("<I", data, at + 16)[0]
+            own = f"{v >> 16}.{(v >> 8) & 0xFF}.{v & 0xFF}"
+        elif cmd in LOADS:
+            dylibs.add(_dylib_name(data, at, size).rsplit("/", 1)[-1])
+        elif cmd == LC_UUID:
+            found = str(uuid.UUID(bytes=data[at + 8:at + 24])).upper()
+        elif cmd in (LC_BUILD_VERSION, LC_VERSION_MIN_MACOSX):
+            version = struct.unpack_from("<I", data, at + (12 if cmd == LC_BUILD_VERSION else 8))[0]
+            minos = (version >> 16, (version >> 8) & 0xFF)
+        at += size
+    kegs = frozenset((f.decode(), v.decode()) for f, v in KEG.findall(data, offset, offset + length))
+    return ARCHS[cpu], Slice(found, minos, kegs, own, frozenset(dylibs))
+
+
+def _ranges(data: bytes) -> list[tuple[int, int]]:
+    """(offset, length) of each architecture's image in a thin or fat Mach-O file."""
+    if data[:4] == b"\xca\xfe\xba\xbe":
+        count = struct.unpack_from(">I", data, 4)[0]
+        return [struct.unpack_from(">iiII", data, 8 + 20 * i)[2:] for i in range(count)]
+    return [(0, len(data))]
+
+
+def slices(data: bytes) -> dict[str, Slice]:
+    """Each architecture of a 64-bit Mach-O image (thin or fat) -> its UUID, minimum macOS, kegs, own version
+    and linked libraries."""
+    return dict(s for o, length in _ranges(data) if len(data) >= o + 32 and (s := _slice(data, o, length)))
+
+
+def loads(data: bytes) -> list[str]:
+    """The install names of the libraries a thin or fat Mach-O image loads (every architecture's, in order, each
+    once), read without otool so any OS can follow a closure."""
+    names: dict[str, None] = {}
+    for offset, _ in _ranges(data):
+        if len(data) < offset + 32 or struct.unpack_from("<I", data, offset)[0] != 0xFEEDFACF:
+            continue
+        at = offset + 32
+        for _ in range(struct.unpack_from("<I", data, offset + 16)[0]):
+            cmd, size = struct.unpack_from("<II", data, at)
+            if cmd in LOADS:
+                names[_dylib_name(data, at, size)] = None
+            at += size
+    return list(names)
+
+
+def extract(data: bytes, arch: str) -> bytes:
+    """One architecture's image of a thin or fat Mach-O file, as `lipo -thin` writes it."""
+    for o, length in _ranges(data):
+        if len(data) >= o + 32 and (s := _slice(data, o, length)) and s[0] == arch:
+            return data[o:o + length]
+    raise RuntimeError(f"no {arch} image in this Mach-O file")
+
+
+def is_macho(path: Path) -> bool:
+    with path.open("rb") as f:
+        head = f.read(8)
+    if head[:4] == b"\xca\xfe\xba\xbe":  # fat, unless it's a Java class file (same magic, then its version)
+        return len(head) == 8 and 0 < struct.unpack(">I", head[4:])[0] < 32
+    return head[:4] in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf")
+
+
+def check_minos(files: Iterable[Path], minimum: tuple[int, int]) -> None:
+    """Every Mach-O image among files runs on macOS minimum: a newer runner or SDK must not raise the macOS
+    what simee ships needs (simee-kicad#57). Files that aren't Mach-O are skipped."""
+    newer = [f"{f} ({arch}): {s.minos[0]}.{s.minos[1]}"
+             for f in files if f.is_file() and not f.is_symlink() and is_macho(f)
+             for arch, s in slices(f.read_bytes()).items() if s.minos > minimum]
+    if newer:
+        raise RuntimeError(f"built for a newer macOS than {minimum[0]}.{minimum[1]}:\n" + "\n".join(newer))
+
+
+def thin(path: Path, arch: str) -> None:
+    archs = subprocess.run(["lipo", "-archs", str(path)], capture_output=True, text=True, check=True).stdout.split()
+    if len(archs) > 1:
+        tmp = path.with_name(path.name + ".thin")
+        subprocess.run(["lipo", "-thin", arch, str(path), "-output", str(tmp)], check=True)
+        tmp.replace(path)
+
+
+def adhoc_sign(path: Path) -> None:
+    # Deleting files or thinning invalidates the original signatures; dyld refuses those.
+    subprocess.run(["codesign", "--force", "--sign", "-", str(path)], check=True, capture_output=True)
